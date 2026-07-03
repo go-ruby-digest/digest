@@ -159,6 +159,37 @@ func TestSumHelpers(t *testing.T) {
 	}
 }
 
+// TestOneShotAllAlgos exercises the class one-shots Sum / HexSum / Base64Sum for
+// EVERY algorithm — driving each fastSum fast-path case (MD5/SHA1/SHA256/SHA384/
+// SHA512) and the RMD160 streaming fallback — with no dependency on ruby, so the
+// no-ruby CI lanes alone hold every one-shot branch at 100%. Each is pinned to
+// the MRI "abc" golden, and Base64Sum is cross-checked against the binary Sum.
+func TestOneShotAllAlgos(t *testing.T) {
+	for name, wantHex := range goldenHex {
+		bin, err := Sum(name, []byte("abc"))
+		if err != nil {
+			t.Fatalf("Sum(%q): %v", name, err)
+		}
+		if hex.EncodeToString(bin) != wantHex {
+			t.Errorf("Sum(%q) = %x, want %s", name, bin, wantHex)
+		}
+		if len(bin) != wantDigest[name] {
+			t.Errorf("Sum(%q) length = %d, want %d", name, len(bin), wantDigest[name])
+		}
+		hx, err := HexSum(name, []byte("abc"))
+		if err != nil || hx != wantHex {
+			t.Errorf("HexSum(%q) = %q (%v), want %s", name, hx, err, wantHex)
+		}
+		b64, err := Base64Sum(name, []byte("abc"))
+		if err != nil {
+			t.Fatalf("Base64Sum(%q): %v", name, err)
+		}
+		if want := base64.StdEncoding.EncodeToString(bin); b64 != want {
+			t.Errorf("Base64Sum(%q) = %q, want %q", name, b64, want)
+		}
+	}
+}
+
 func TestSumHelpersUnknown(t *testing.T) {
 	if _, err := Sum("NOPE", nil); err == nil {
 		t.Error("Sum unknown should error")

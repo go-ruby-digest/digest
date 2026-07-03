@@ -17,10 +17,12 @@
 //
 // The computation is backed by Go's crypto/* (MD5/SHA1/SHA2) and
 // golang.org/x/crypto/ripemd160 (RMD160) — both pure Go — so every digest is
-// byte-identical to MRI's, with no Ruby runtime and no cgo. It is the digest
-// backend for go-embedded-ruby, but is a standalone, reusable module, a sibling
-// of go-ruby-regexp (the Onigmo engine), go-ruby-erb (the ERB compiler) and
-// go-ruby-yaml (the Psych emitter/loader).
+// byte-identical to MRI's, with no Ruby runtime and no cgo. The one-shot and
+// finish paths sum and hex/Base64-encode through stack buffers so a full
+// hexdigest allocates only its result string (see fastSum / hexEncode). It is
+// the digest backend for go-embedded-ruby, but is a standalone, reusable module,
+// a sibling of go-ruby-regexp (the Onigmo engine), go-ruby-erb (the ERB
+// compiler) and go-ruby-yaml (the Psych emitter/loader).
 package digest
 
 import (
@@ -84,6 +86,69 @@ var algos = map[string]algo{
 	"RMD160": {ripemd160.New, 64},
 }
 
+// maxDigest is the largest binary digest any supported algorithm produces
+// (SHA-512 / RMD160 / … all ≤ 64 bytes). Stack buffers sized to it let the
+// one-shot and finish paths sum-and-encode without a heap allocation for the
+// digest itself. maxHex / maxB64 are the matching worst-case encoded sizes.
+const (
+	maxDigest = 64
+	maxHex    = 2 * maxDigest             // hex.EncodedLen(64) = 128
+	maxB64    = ((maxDigest + 2) / 3) * 4 // base64 padded len of 64 = 88
+)
+
+// fastSum computes the one-shot binary digest of data for a built-in crypto
+// algorithm (identified by its canonical key), returning it in a fixed
+// maxDigest-byte array plus its true length. Because md5.Sum / sha1.Sum /
+// sha256.Sum256 / sha512.Sum384 / sha512.Sum512 each return their result in a
+// value array, escape analysis keeps out on the caller's stack: the digest is
+// produced with zero heap allocation, and the accompanying hasher object the
+// streaming path allocates is avoided entirely. ok is false for RMD160 (which
+// x/crypto exposes no array one-shot for) and for any unrecognised key, telling
+// the caller to fall back to the streaming hasher. The bytes are identical to
+// the streaming path — this only changes how they are produced, never what.
+func fastSum(key string, data []byte) (out [maxDigest]byte, n int, ok bool) {
+	switch key {
+	case "MD5":
+		s := md5.Sum(data)
+		n = copy(out[:], s[:])
+	case "SHA1":
+		s := sha1.Sum(data)
+		n = copy(out[:], s[:])
+	case "SHA256":
+		s := sha256.Sum256(data)
+		n = copy(out[:], s[:])
+	case "SHA384":
+		s := sha512.Sum384(data)
+		n = copy(out[:], s[:])
+	case "SHA512":
+		s := sha512.Sum512(data)
+		n = copy(out[:], s[:])
+	default:
+		return out, 0, false
+	}
+	return out, n, true
+}
+
+// hexEncode hex-encodes a binary digest (≤ maxDigest bytes) into a stack buffer,
+// allocating only the returned string. It is the shared encoder for the
+// streaming finish path and the RMD160 one-shot fallback; the crypto one-shots
+// inline the same two lines so the digest array stays on their own stack (a
+// helper call would leak it to the heap).
+func hexEncode(sum []byte) string {
+	var hb [maxHex]byte
+	n := hex.Encode(hb[:], sum)
+	return string(hb[:n])
+}
+
+// base64Encode Base64-encodes a binary digest (≤ maxDigest bytes) into a stack
+// buffer, allocating only the returned string — the Base64 analogue of
+// hexEncode.
+func base64Encode(sum []byte) string {
+	var bb [maxB64]byte
+	base64.StdEncoding.Encode(bb[:], sum)
+	return string(bb[:base64.StdEncoding.EncodedLen(len(sum))])
+}
+
 // digest is the concrete incremental hasher returned by every constructor. It
 // keeps the live hash.Hash plus the recipe needed to rebuild it on Reset.
 type digest struct {
@@ -91,13 +156,28 @@ type digest struct {
 	h hash.Hash
 }
 
-func (d *digest) Update(data []byte)   { d.h.Write(data) }
-func (d *digest) Reset()               { d.h = d.a.newHash() }
-func (d *digest) Finish() []byte       { return d.h.Sum(nil) }
-func (d *digest) HexFinish() string    { return hex.EncodeToString(d.h.Sum(nil)) }
-func (d *digest) Base64Finish() string { return base64.StdEncoding.EncodeToString(d.h.Sum(nil)) }
-func (d *digest) BlockLength() int     { return d.a.block }
-func (d *digest) DigestLength() int    { return d.a.newHash().Size() }
+func (d *digest) Update(data []byte) { d.h.Write(data) }
+func (d *digest) Reset()             { d.h = d.a.newHash() }
+func (d *digest) Finish() []byte     { return d.h.Sum(nil) }
+func (d *digest) BlockLength() int   { return d.a.block }
+func (d *digest) DigestLength() int  { return d.a.newHash().Size() }
+
+// HexFinish reads the running digest and hex-encodes it. The binary digest is
+// summed into a stack array (no digest one exceeds 64 bytes) and hex-encoded into
+// a second stack buffer, so the heap sees only the interface-forced Sum slice and
+// the returned string — versus the three allocations the naive
+// hex.EncodeToString(h.Sum(nil)) pair used to make.
+func (d *digest) HexFinish() string {
+	var db [maxDigest]byte
+	return hexEncode(d.h.Sum(db[:0]))
+}
+
+// Base64Finish reads the running digest and Base64-encodes it, with the same
+// single-allocation, stack-buffered strategy as HexFinish.
+func (d *digest) Base64Finish() string {
+	var db [maxDigest]byte
+	return base64Encode(d.h.Sum(db[:0]))
+}
 
 // canonical normalises an algorithm name the way both Digest and OpenSSL accept
 // it: case-insensitive and tolerant of the dashed spelling ("SHA-256", "sha1").
@@ -152,34 +232,57 @@ func SHA512() Digest { return must("SHA512") }
 func RMD160() Digest { return must("RMD160") }
 
 // Sum is the binary class one-shot Digest::ALGO.digest(data): the raw digest of
-// data under the named algorithm.
+// data under the named algorithm. For the built-in crypto algorithms it uses the
+// allocation-free stack hasher (fastSum), copying out only the exact-length
+// result slice it must return; RMD160 falls back to the streaming hasher.
 func Sum(name string, data []byte) ([]byte, error) {
-	d, err := New(name)
-	if err != nil {
-		return nil, err
+	a, ok := algos[canonical(name)]
+	if !ok {
+		return nil, fmt.Errorf("digest: unknown algorithm %q", name)
 	}
-	d.Update(data)
-	return d.Finish(), nil
+	if d, n, fast := fastSum(canonical(name), data); fast {
+		return append([]byte(nil), d[:n]...), nil
+	}
+	h := a.newHash()
+	h.Write(data)
+	return h.Sum(nil), nil
 }
 
-// HexSum is the class one-shot Digest::ALGO.hexdigest(data).
+// HexSum is the class one-shot Digest::ALGO.hexdigest(data). This is the exact
+// Go analogue of Ruby's Digest::SHA256.hexdigest(s) — the hot path the parity
+// benchmark exercises. For the crypto algorithms it sums into a stack array and
+// hex-encodes (inline, so the array never escapes) into a second stack buffer,
+// leaving the returned string as the sole allocation.
 func HexSum(name string, data []byte) (string, error) {
-	d, err := New(name)
-	if err != nil {
-		return "", err
+	key := canonical(name)
+	if _, ok := algos[key]; !ok {
+		return "", fmt.Errorf("digest: unknown algorithm %q", name)
 	}
-	d.Update(data)
-	return d.HexFinish(), nil
+	if d, n, fast := fastSum(key, data); fast {
+		var hb [maxHex]byte
+		m := hex.Encode(hb[:], d[:n])
+		return string(hb[:m]), nil
+	}
+	h := algos[key].newHash()
+	h.Write(data)
+	return hexEncode(h.Sum(nil)), nil
 }
 
-// Base64Sum is the class one-shot Digest::ALGO.base64digest(data).
+// Base64Sum is the class one-shot Digest::ALGO.base64digest(data), with the same
+// stack-buffered single-allocation strategy as HexSum.
 func Base64Sum(name string, data []byte) (string, error) {
-	d, err := New(name)
-	if err != nil {
-		return "", err
+	key := canonical(name)
+	if _, ok := algos[key]; !ok {
+		return "", fmt.Errorf("digest: unknown algorithm %q", name)
 	}
-	d.Update(data)
-	return d.Base64Finish(), nil
+	if d, n, fast := fastSum(key, data); fast {
+		var bb [maxB64]byte
+		base64.StdEncoding.Encode(bb[:], d[:n])
+		return string(bb[:base64.StdEncoding.EncodedLen(n)]), nil
+	}
+	h := algos[key].newHash()
+	h.Write(data)
+	return base64Encode(h.Sum(nil)), nil
 }
 
 // SumFile is the class one-shot Digest::ALGO.file(path): the binary digest of a
@@ -214,7 +317,7 @@ func HexSumFile(name, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(b), nil
+	return hexEncode(b), nil
 }
 
 // Base64SumFile is Digest::ALGO.file(path).base64digest.
@@ -223,7 +326,7 @@ func Base64SumFile(name, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return base64.StdEncoding.EncodeToString(b), nil
+	return base64Encode(b), nil
 }
 
 // bubbleVowels and bubbleConsonants are the alphabets of the Bubble Babble
